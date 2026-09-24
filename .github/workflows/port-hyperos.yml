@@ -1,0 +1,166 @@
+name: Port HyperOS ROM (annibale -> marble)
+
+"on":
+  workflow_dispatch:
+    inputs:
+      source_rom_url:
+        description: 'Donor (source framework) ROM URL'
+        required: false
+        type: string
+      target_rom_url:
+        description: 'marble (hardware baseline) ROM URL'
+        required: false
+        type: string
+      analysis_only:
+        description: 'true = inspect + report only, no image rebuild/package (recommended first run)'
+        required: false
+        type: boolean
+        default: true
+      build_kernel:
+        description: 'Attach the Melt-Rebase kernel as a companion flashable'
+        required: false
+        type: boolean
+        default: false
+      run_device_test:
+        description: 'Collect ADB diagnostics (only does anything on a self-hosted runner with a device attached)'
+        required: false
+        type: boolean
+        default: false
+      create_release:
+        description: 'Publish outputs as a GitHub Release on this repo'
+        required: false
+        type: boolean
+        default: false
+      disable_avb_for_testing:
+        description: 'Explicit opt-in flag only -- does not silently disable AVB (see avb-report.md)'
+        required: false
+        type: boolean
+        default: false
+      force_package_despite_fail:
+        description: 'DANGEROUS: package even if the validation matrix has FAIL entries'
+        required: false
+        type: boolean
+        default: false
+      output_name:
+        description: 'Base name for the output ZIP'
+        required: false
+        type: string
+        default: 'marble_HyperOS_Port'
+
+  # push/schedule intentionally left disabled by default: a single run
+  # downloads two multi-GB Xiaomi OTA packages and can run over an hour.
+  # Uncomment only with a clear reason (e.g. a nightly analysis-only
+  # tracking run), and keep analysis_only=true for anything unattended.
+  # schedule:
+  #   - cron: '0 18 * * *'
+
+permissions:
+  contents: write   # softprops/action-gh-release needs this, or GITHUB_TOKEN
+                     # defaults to read-only and the release step 403s.
+
+jobs:
+  port:
+    name: Port ROM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      SOURCE_ROM_URL: ${{ inputs.source_rom_url }}
+      TARGET_ROM_URL: ${{ inputs.target_rom_url }}
+      ANALYSIS_ONLY: ${{ inputs.analysis_only }}
+      BUILD_KERNEL: ${{ inputs.build_kernel }}
+      RUN_DEVICE_TEST: ${{ inputs.run_device_test }}
+      CREATE_RELEASE: ${{ inputs.create_release }}
+      DISABLE_AVB_FOR_TESTING: ${{ inputs.disable_avb_for_testing }}
+      FORCE_PACKAGE_DESPITE_FAIL: ${{ inputs.force_package_despite_fail }}
+      OUTPUT_NAME: ${{ inputs.output_name }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      KERNEL_TRIGGER_PAT: ${{ secrets.KERNEL_TRIGGER_PAT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Xiaomi OTA pairs can exceed 15GB combined; GitHub-hosted runners
+      # ship ~14GB free by default without this.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: 01 - Toolchain
+        run: bash scripts/01_toolchain.sh
+
+      - name: 02 - Download + verify ROMs
+        run: bash scripts/02_download_verify.sh
+
+      - name: 03 - Extract + detect ROM structure
+        run: bash scripts/03_extract_detect.sh
+
+      - name: 04 - Inventory + classify partitions
+        run: bash scripts/04_inventory_classify.sh
+
+      - name: 05 - Compatibility analysis (VINTF/SELinux/linker/ART/props)
+        run: bash scripts/05_compatibility_analysis.sh
+
+      - name: 06 - Merge port workspace
+        if: ${{ inputs.analysis_only != true }}
+        run: bash scripts/06_merge_port.sh
+
+      - name: 07 - Rebuild partition images
+        if: ${{ inputs.analysis_only != true }}
+        run: bash scripts/07_rebuild_images.sh
+
+      - name: 08 - Kernel integration
+        if: ${{ inputs.analysis_only != true }}
+        run: bash scripts/08_kernel_integration.sh
+
+      - name: 09 - Final validation + package
+        run: bash scripts/09_validate_package.sh
+
+      - name: 10 - Generate consolidated reports
+        if: always()
+        run: bash scripts/10_report.sh
+
+      - name: 11 - Optional device diagnostics
+        if: always()
+        run: bash scripts/11_diagnostics.sh
+
+      - name: Upload reports (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-reports
+          path: build/reports/
+          retention-days: 30
+
+      - name: Upload package (if built)
+        if: ${{ inputs.analysis_only != true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rom-package
+          path: |
+            build/output/*.zip
+            build/output/SHA256SUMS
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload device diagnostics (if collected)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-diagnostics
+          path: build/logs/device/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release == true && inputs.analysis_only != true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: port-${{ github.run_id }}
+          name: "HyperOS port ${{ github.run_id }}"
+          body_path: build/reports/build-summary.md
+          files: |
+            build/output/*.zip
+            build/output/SHA256SUMS
+            
