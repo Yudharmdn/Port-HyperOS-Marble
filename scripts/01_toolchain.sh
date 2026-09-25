@@ -15,9 +15,47 @@ mkdir -p "$SRC_DIR" "$TGT_DIR" "$WORK_TREE" "$IMG_DIR" "$REPORT_DIR" "$LOG_DIR"
 sudo apt-get update -qq
 
 ensure_tools curl wget unzip zip git python3 jq lz4 zstd file find grep sed awk \
-             sha256sum rsync xmllint shellcheck 7z \
+             sha256sum rsync xmllint shellcheck 7z cpio \
              simg2img img2simg unpack_bootimg \
-             e2fsck resize2fs tune2fs debugfs mkfs.erofs dump.erofs fsck.erofs
+             e2fsck resize2fs tune2fs debugfs
+
+# erofs-utils: Ubuntu 24.04 ships 1.7.1, whose fsck.erofs --extract cannot
+# restore xattrs -- every SELinux label and file capability was lost on
+# extraction (that is why relabeling was needed at all). v1.9.4 has
+# --xattrs; the small patch in lib/ additionally re-applies xattrs after
+# chown, because the kernel clears security.capability on chown and
+# upstream applies xattrs first (verified: without it, capabilities are
+# dropped; with it they survive extract -> rebuild -> extract).
+# Built from the pinned, checksummed GitHub source tarball; installed to
+# /usr/local so it shadows the distro version (sudo's secure_path
+# searches /usr/local first).
+EROFS_VERSION="1.9.4"
+EROFS_SHA256="7d135aa2550326a5acf20f53c518aea5a8900015ce50700044e40f818c31dd80"
+if ! /usr/local/bin/fsck.erofs --help 2>&1 | grep -q -- '--\[no-\]xattrs'; then
+    log_info "Building erofs-utils v$EROFS_VERSION (+ capability-preserving fsck patch)"
+    sudo apt-get install -y -qq autoconf automake libtool pkg-config liblz4-dev liblzma-dev \
+        uuid-dev libselinux1-dev zlib1g-dev >/dev/null
+    EROFS_TMP="$(mktemp -d)"
+    curl -fL --retry 5 --retry-all-errors -o "$EROFS_TMP/src.tar.gz" \
+        "https://github.com/erofs/erofs-utils/archive/refs/tags/v${EROFS_VERSION}.tar.gz"
+    echo "$EROFS_SHA256  $EROFS_TMP/src.tar.gz" | sha256sum -c - \
+        || die "erofs-utils v$EROFS_VERSION source tarball checksum mismatch -- refusing to build it"
+    tar -xzf "$EROFS_TMP/src.tar.gz" -C "$EROFS_TMP"
+    (
+        cd "$EROFS_TMP/erofs-utils-${EROFS_VERSION}"
+        patch -p1 < "$SCRIPT_DIR/lib/erofs-fsck-preserve-caps.patch"
+        ./autogen.sh >/dev/null 2>&1
+        ./configure --enable-lz4 --enable-lzma --with-selinux --prefix=/usr/local >/dev/null
+        make -j"$(nproc)" >/dev/null
+        sudo make install >/dev/null
+    ) || die "erofs-utils v$EROFS_VERSION build failed"
+    rm -rf "$EROFS_TMP"
+    hash -r
+fi
+for t in mkfs.erofs dump.erofs fsck.erofs; do
+    [ "$(command -v "$t")" = "/usr/local/bin/$t" ] || die "$t does not resolve to the built v$EROFS_VERSION (/usr/local/bin) -- got '$(command -v "$t")'"
+done
+fsck.erofs --help 2>&1 | grep -q -- '--\[no-\]xattrs' || die "fsck.erofs lacks --xattrs; label-preserving extraction impossible"
 
 # payload-dumper-go (for OTA payload.bin) is not an apt package; pin a
 # known-working release build. The pipeline's original pin (v1.3.2)
@@ -85,7 +123,7 @@ if command -v mkbootimg >/dev/null 2>&1; then
     log_info "Note: the 'mkbootimg' binary that ships alongside unpack_bootimg is confirmed broken on this image (crashes on any invocation -- a missing 'gki' module the apt package never declares as a dependency). This pipeline only calls unpack_bootimg, which works fine, so this is not fetched or worked around."
 fi
 
-for t in curl wget unzip zip git python3 jq lz4 zstd file rsync xmllint shellcheck \
+for t in curl wget unzip zip git python3 jq lz4 zstd file rsync xmllint shellcheck cpio \
          simg2img img2simg unpack_bootimg avbtool \
          e2fsck resize2fs tune2fs debugfs mkfs.erofs dump.erofs fsck.erofs payload-dumper-go; do
     ver_line="$("$t" --version 2>&1 | head -n1 || true)"
