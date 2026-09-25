@@ -20,16 +20,32 @@ ensure_tools curl wget unzip zip git python3 jq lz4 zstd file find grep sed awk 
              e2fsck resize2fs tune2fs debugfs mkfs.erofs dump.erofs fsck.erofs
 
 # payload-dumper-go (for OTA payload.bin) is not an apt package; pin a
-# known-working release build. If the pinned asset disappears upstream,
-# fail loudly rather than silently falling back to an unpinned "latest"
-# that hasn't been validated against this pipeline.
-PDG_VERSION="1.3.2"
+# known-working release build. The pipeline's original pin (v1.3.2)
+# turned out to never have existed as a real tag -- confirmed the hard
+# way when a real run hit curl 404s on it after 5 retries. v2.1.0 is
+# the actual latest release: live-downloaded and confirmed here to
+# still expose the same -list/-o flags and positional payload.bin
+# argument this pipeline already calls it with (its own README shows
+# no CLI change from the 1.x line). If the pinned asset disappears
+# upstream, fail loudly rather than silently falling back to an
+# unpinned "latest" that hasn't been validated against this pipeline.
+# Checksummed against the release's own published sha256 file rather
+# than just downloaded and trusted.
+PDG_VERSION="2.1.0"
 if ! command -v payload-dumper-go >/dev/null 2>&1; then
     log_info "Installing payload-dumper-go v$PDG_VERSION"
-    curl -fL --retry 5 --retry-all-errors -o /tmp/pdg.tar.gz \
-        "https://github.com/ssut/payload-dumper-go/releases/download/${PDG_VERSION}/payload-dumper-go_${PDG_VERSION}_linux_amd64.tar.gz"
-    tar -xzf /tmp/pdg.tar.gz -C /tmp
-    sudo install -m 0755 /tmp/payload-dumper-go /usr/local/bin/payload-dumper-go
+    PDG_TMP="$(mktemp -d)"
+    PDG_ASSET="payload-dumper-go_${PDG_VERSION}_linux_amd64.tar.gz"
+    curl -fL --retry 5 --retry-all-errors -o "$PDG_TMP/$PDG_ASSET" \
+        "https://github.com/ssut/payload-dumper-go/releases/download/${PDG_VERSION}/${PDG_ASSET}"
+    curl -fL --retry 5 --retry-all-errors -o "$PDG_TMP/checksums.txt" \
+        "https://github.com/ssut/payload-dumper-go/releases/download/${PDG_VERSION}/payload-dumper-go_sha256checksums.txt"
+    grep "$PDG_ASSET" "$PDG_TMP/checksums.txt" | grep -v avx2 > "$PDG_TMP/checksum_line.txt"
+    (cd "$PDG_TMP" && sha256sum -c checksum_line.txt) \
+        || die "payload-dumper-go v$PDG_VERSION failed checksum verification against its own published sha256 file"
+    tar -xzf "$PDG_TMP/$PDG_ASSET" -C "$PDG_TMP"
+    sudo install -m 0755 "$PDG_TMP/payload-dumper-go" /usr/local/bin/payload-dumper-go
+    rm -rf "$PDG_TMP"
 fi
 command -v payload-dumper-go >/dev/null 2>&1 || die "payload-dumper-go install failed"
 
