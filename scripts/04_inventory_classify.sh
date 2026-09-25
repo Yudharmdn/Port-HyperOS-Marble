@@ -35,7 +35,7 @@ declare -A SRC_SIZE SRC_FS TGT_SIZE TGT_FS
 while IFS=$'\t' read -r name size fs; do SRC_SIZE[$name]="$size"; SRC_FS[$name]="$fs"; done < "$REPORT_DIR/source_partition_inventory.tsv"
 while IFS=$'\t' read -r name size fs; do TGT_SIZE[$name]="$size"; TGT_FS[$name]="$fs"; done < "$REPORT_DIR/target_partition_inventory.tsv"
 
-all_names="$(printf '%s\n%s\n' "${!SRC_SIZE[*]}" "${!TGT_SIZE[*]}" | tr ' ' '\n' | sort -u | grep -v '^$')"
+all_names="$(printf '%s\n%s\n' "${!SRC_SIZE[*]}" "${!TGT_SIZE[*]}" | tr ' ' '\n' | sort -u | grep -v '^$' || true)"
 
 PORTABLE_TOTAL=0
 for name in $all_names; do

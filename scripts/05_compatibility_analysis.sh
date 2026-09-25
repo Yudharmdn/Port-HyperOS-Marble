@@ -99,7 +99,7 @@ selinux_report="$REPORT_DIR/selinux-report.md"
     echo
 } > "$selinux_report"
 
-extract_types() { grep -hoE ':[a-zA-Z0-9_]+:s0' "$@" 2>/dev/null | sort -u; }
+extract_types() { grep -hoE ':[a-zA-Z0-9_]+:s0' "$@" 2>/dev/null | sort -u || true; }
 src_ctx_files="$(find "$EXTRACT_SRC" -iname '*_contexts' -o -iname '*file_contexts*' 2>/dev/null || true)"
 tgt_ctx_files="$(find "$EXTRACT_TGT" -iname '*_contexts' -o -iname '*file_contexts*' 2>/dev/null || true)"
 
@@ -145,7 +145,7 @@ lib_inventory="$(find "$EXTRACT_SRC" "$EXTRACT_TGT" \( -iname '*.so' -o -iname '
 missing_total=0
 while IFS= read -r -d '' elf; do
     file -b "$elf" 2>/dev/null | grep -q ELF || continue
-    needed="$(readelf -d "$elf" 2>/dev/null | grep NEEDED | sed -E 's/.*\[(.*)\].*/\1/')"
+    needed="$(readelf -d "$elf" 2>/dev/null | grep NEEDED | sed -E 's/.*\[(.*)\].*/\1/' || true)"
     [ -z "$needed" ] && continue
     missing=""
     while read -r lib; do
