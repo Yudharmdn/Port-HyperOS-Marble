@@ -6,95 +6,83 @@ Android 15 vendor baseline) via GitHub Actions.
 
 ## Before you run it
 
-- Bootloader unlocked on the target marble device (this only produces a
-  recovery-flashable ZIP; nothing here unlocks anything).
-- **Run with `analysis_only: true` first.** Android 17 framework against an
-  Android 15 vendor baseline is a real framework/vendor boundary, not a
-  cosmetic version bump -- read `build/reports/compatibility.md` from that
-  run before ever setting `analysis_only: false`.
-- A custom recovery (OrangeFox/TWRP) on marble. The output package is
-  recovery-flash-only; there is no fastboot `flash.sh` path in this version.
+- **Unlocked bootloader** on marble. A real build rebuilds system/
+  system_ext/product/vendor/odm and (by default) swaps boot.img, so it can
+  only boot with AVB verification disabled -- which needs an unlocked
+  bootloader.
+- **Run with `analysis_only: true` first** and read
+  `build/reports/compatibility.md`.
+- For `analysis_only: false`, also tick `disable_avb_for_testing`
+  (explained under "AVB" below) -- without it the build FAILs on purpose.
+- Flashing: custom recovery (OrangeFox/TWRP) **or** the generated
+  `flash_fastboot.sh` / `.bat`. Use fastboot if the recovery reports that a
+  partition is too small and it has no `lptools` -- fastbootd resizes
+  logical partitions itself.
 
-## What "PASS" actually means here (read this)
+## What each check really decides
 
-Every check in `build/reports/build-summary.md` is real, but static:
+Static checks only; "Device boot test: NOT TESTED" stays until a real
+device run (`11_diagnostics.sh` on a self-hosted runner) says otherwise.
 
-- **VINTF / linker / SELinux-type checks** compare names and structural
-  facts extracted from the ROMs. They catch missing HALs, missing shared
-  libraries, and SELinux types with no target policy rule. They do **not**
-  check runtime behavior, symbol-level ABI, or AIDL/HIDL semantic
-  compatibility -- a PASS there is "nothing obviously missing," not
-  "guaranteed to work."
-- **SELinux relabeling on rebuilt vendor/odm EXT4 images is best-effort**
-  (`scripts/lib/apply_contexts.py`), not AOSP's own `e2fsdroid`/
-  `mkuserimg_mke2fs`. `fs_config` (uid/gid/mode/capabilities) is not
-  reproduced at all. This is the same tradeoff the earlier quick-port hit
-  in practice: if you see `avc: denied` in logcat after flashing, boot
-  with SELinux permissive once to confirm, then expect to hand-patch
-  policy for that path.
-- **Dynamic partition sizing is an estimate.** Both ROMs ship as
-  `payload.bin`-based full OTAs with no standalone `super.img` to `lpdump`,
-  so capacity is inferred from marble's currently-shipped partition sizes
-  plus a slack margin, not a verified device group limit.
-- **`avb_boot_descriptor_mismatch` is a best-effort text match, not a
-  parsed AVB structure.** When `use_custom_boot_img` replaces `boot.img`,
-  `09_validate_package.sh` greps `avbtool info_image`'s human-readable
-  output for a `Partition Name: boot` line to decide whether vbmeta
-  still expects the original image. It errs toward FAIL when it finds
-  that line and AVB isn't disabled -- but a WARN instead of a clean
-  PASS/FAIL means the grep itself was inconclusive; read `avb-report.md`
-  directly in that case rather than trusting the ledger alone.
-- **"Device boot test: NOT TESTED" is the expected, honest default.** A
-  GitHub-hosted runner cannot reboot your phone. `scripts/11_diagnostics.sh`
-  only collects real ADB diagnostics if it's ever pointed at a self-hosted
-  runner with the device attached; otherwise it says so plainly instead of
-  guessing.
+- **VINTF** (`vintf_fcm_level`, `vintf_kernel`, `vintf_required_hals`):
+  mirrors libvintf's decision -- picks the Android 17 framework matrix at
+  marble's FCM `target-level`, FAILs if that level is no longer supported,
+  if the matrix doesn't allow kernel `TARGET_KERNEL_VERSION` (5.10), or if
+  a HAL marked `optional="false"` is missing. HALs without that marker are
+  optional (default since the Android V-era libvintf change; the tag isn't
+  supported from Android 16). Does not run libvintf itself.
+- **SELinux** (`selinux_mapping`): FAILs if the source platform policy has
+  no `mapping/<ver>.cil` for marble's `plat_sepolicy_vers.txt` -- without
+  it the split policy cannot compile at boot. Runtime denials can only be
+  found on a real boot.
+- **Labels / fs_config** (`selinux_labels`): partitions are extracted as
+  root with ownership, modes, SELinux labels and file capabilities
+  preserved (patched erofs-utils 1.9.4, see `01_toolchain.sh`), so the
+  images are rebuilt with the device maker's real metadata.
+  `apply_contexts.py` only fills labels that are genuinely missing.
+- **Linker** (`linker_analysis`): every DT_NEEDED of the ported framework
+  must exist somewhere in source+target, including inside `.apex` and
+  compressed `.capex` modules. Name-level only, not symbol-level ABI.
+- **Dynamic partitions** (`dynamic_partition_sizing`): the limit is
+  marble's real group size read from its own OTA payload manifest
+  (`lib/payload_meta.py`); 04 records a pre-build estimate, 09 checks the
+  actual built images and blocks packaging if they don't fit.
+- **fstab** (`fstab_patch`, `first_stage_fstab`): vendor/odm converted to
+  ext4 get an ext4 entry in `/vendor/etc/fstab.*`; and because first-stage
+  init mounts from the **vendor_boot ramdisk** fstab, that fstab is
+  unpacked and checked too -- FAIL if it has no ext4 entry for them
+  (fix: `VENDOR_ODM_FS=erofs`; vendor_boot is not repacked).
 
-Build success, package success, static-validation success, and device-boot
-success are four different claims. This pipeline only ever asserts the
-first three, and labels the fourth "NOT TESTED" until it's actually true.
+## AVB
+
+Rebuilt images and a replaced boot.img no longer match marble's
+vbmeta/vbmeta_system descriptors. With `disable_avb_for_testing: true`
+the **packaged** `vbmeta.img` and `vbmeta_system.img` are freshly authored
+flags=3 images (verity + verification off); marble's originals stay in
+`build/images/*.ORIGINAL.img` and are not flashed. Without the flag the
+build FAILs (`avb_state`) -- re-signing is not implemented. This is an
+explicit, logged opt-in, never a silent disable.
 
 ## Layout
 
 ```
-config/port.env                    all tunables, defaults, no secrets
-scripts/lib/common.sh               logging + the PASS/WARN/FAIL/NOT-TESTED ledger
-scripts/lib/apply_contexts.py       best-effort SELinux relabeling (see caveat above)
-scripts/01_toolchain.sh             Phase A: tool install
-scripts/02_download_verify.sh       Phase A: download + integrity
-scripts/03_extract_detect.sh        Phase A: payload.bin/super.img/loose-image detection
-scripts/04_inventory_classify.sh    Phase A/B: partition classification + sizing
-scripts/05_compatibility_analysis.sh Phase A/D: VINTF/SELinux/linker/ART/props
-scripts/06_merge_port.sh            Phase C: workspace construction
-scripts/07_rebuild_images.sh        Phase C: fstab patch + image rebuild
-scripts/08_kernel_integration.sh    Phase C: custom boot.img swap + optional root-variant zip
-scripts/09_validate_package.sh      Phase D/E: final gate + streaming-ZIP packaging
-scripts/10_report.sh                Phase G prep: consolidated reports
-scripts/11_diagnostics.sh           Phase F: optional real-device diagnostics
-.github/workflows/port-hyperos.yml  orchestrates all of the above
+config/port.env                        all tunables, defaults, no secrets
+scripts/lib/common.sh                  logging + PASS/WARN/FAIL/NOT-TESTED ledger
+scripts/lib/apply_contexts.py          fill-only SELinux labeling for unlabeled files
+scripts/lib/payload_meta.py            reads groups/sizes from an OTA payload manifest
+scripts/lib/dynamic_fit.py             group-capacity check (estimate / built images)
+scripts/lib/erofs-fsck-preserve-caps.patch  keeps file capabilities on erofs extract
+scripts/01_toolchain.sh ... 11_diagnostics.sh   phases A-G
+.github/workflows/port-hyperos.yml     orchestrates all of the above
 ```
 
 ## Kernel integration
 
-Two independent mechanisms, confirmed by inspecting each repo's real
-release assets rather than assumed:
-
-**1. The boot image itself -- `use_custom_boot_img: true` (default).**
-Fetches `boot.img` from `Yudharmdn/boot-melt-rebase`'s latest release
-(confirmed: a single real 192MB `boot.img` asset, sha256 `29ea2b8f...
-c3fa3`) and **replaces** marble's passthrough `boot.img` with it before
-packaging. This is a real substitution, not a companion file -- and it
-has a real consequence: vbmeta's original AVB hash descriptor for
-`boot` no longer matches, so verification will fail on a locked/
-enforcing bootloader. `09_validate_package.sh` checks for this
-explicitly (`avb_boot_descriptor_mismatch` in the status ledger) and
-**fails the build** unless `disable_avb_for_testing: true` is also set
-or you re-sign vbmeta yourself. If the target ROM ships a separate
-`init_boot` partition (common on Android 13+ GKI devices, which marble
-likely is), this stage also unpacks the fetched `boot.img` to check
-whether it still bundles its own ramdisk -- a combined-format image on
-a split-scheme device is a common, distinct bootloop cause, and this
-check exists specifically to catch that mismatch before you flash.
+**1. The boot image -- `use_custom_boot_img: true` (default).** Fetches
+`boot.img` from `Yudharmdn/boot-melt-rebase` (192MB, sha256
+`29ea2b8f...c3fa3`) and replaces marble's boot.img. This is one reason AVB
+must be disabled (see above). If marble ships a separate `init_boot`, the
+fetched image is unpacked to check it isn't a combined-ramdisk image.
 
 **2. An optional post-boot root solution -- `build_kernel: true`.**
 Separate from (1) and not required for the port to boot. Inspecting
@@ -116,56 +104,25 @@ inside it), then this zip, in the same recovery session.
 
 ## Known gaps, stated plainly
 
-- No fastboot/`flash.sh` path (recovery-only, unlike the earlier quick-port).
-- `fs_config` (uid/gid/mode/capabilities) is not reproduced on rebuilt images.
-- Deep per-APK/per-service dependency semantics (spec sections 14-15,
-  44) are classified at the whole-partition level, not the individual
-  package level -- HyperOS app-by-app hardware-dependency classification
-  is flagged as a manual-review checklist item in `compatibility.md`,
-  not automated line-by-line.
-- The repo name given for kernel integration in the original brief
-  (`yudharn/Melt-Kernel-Marble`) didn't match any real repo.
-  `KERNEL_SOURCE_REPO` / `KERNEL_BOOT_IMG_REPO` / `KERNEL_ARTIFACT_REPO`
-  are separate, overridable inputs, each pointed at a repo whose actual
-  release assets were checked directly (not assumed) -- see "Kernel
-  integration" above for exactly what was found.
-- `boot_init_boot_split_check` (when it runs) trusts `unpack_bootimg`'s
-  text log to read the boot-image header version and ramdisk size; a
-  malformed or unusually-formatted log falls back to a WARN rather than
-  a false PASS, but isn't a substitute for confirming the split/combined
-  format against Melt-Rebase's own build notes.
-- No AVB re-signing is performed anywhere in this pipeline. Once
-  `use_custom_boot_img` trips `avb_boot_descriptor_mismatch`, the only
-  paths forward are `disable_avb_for_testing: true` (writes a separate,
-  clearly-named disabled-verification vbmeta) or re-signing vbmeta
-  yourself with a key the bootloader trusts -- this script does neither
-  silently.
-- `bash -n`/shellcheck do not catch every real failure mode. A live run
-  found `readelf -d <elf> | grep NEEDED | ...` silently killing the
-  entire script the moment it hit any binary with zero NEEDED entries
-  (extremely common) -- under `set -e -o pipefail`, grep finding
-  nothing is treated as a hard failure, with no error message at all,
-  not a "no results" case. Fixed here and audited for the same pattern
-  everywhere else in the codebase, but a shell script can still fail
-  this way somewhere static analysis won't flag; a live run remains
-  the real test.
-- Toolchain package names were corrected after a real first run failed
-  on them (`android-sdk-libufdt-utils` doesn't exist, and apt aborts an
-  entire multi-package install the moment one name is unresolvable --
-  which had also been silently blocking otherwise-fine packages in the
-  same batch). `simg2img`/`img2simg`/`unpack_bootimg` are now confirmed,
-  live-tested real packages, and `ensure_tools` now installs one
-  package at a time so a single bad name can't take others down with
-  it. Two things stay genuinely open rather than papered over: the
-  `mkbootimg` binary that ships alongside `unpack_bootimg` is confirmed
-  broken on Ubuntu 24.04 (crashes on any invocation from a dependency
-  the package never declares) -- harmless here since only
-  `unpack_bootimg` is ever called -- and `lpunpack` has no official
-  package at all, so it's checked lazily where it would actually be
-  used (a standalone-`super.img` ROM) rather than required for every
-  run; today's payload.bin-based pair never reaches that path.
-- The `payload-dumper-go` version this pipeline pins was also wrong
-  (`1.3.2` never existed as a real tag -- confirmed via a live 404).
-  Bumped to `2.1.0`, the real latest, with its CLI flags (`-list`/`-o`)
-  confirmed unchanged from the 1.x line, and its download is now
-  checksummed against the release's own published sha256 file.
+- No AVB re-signing; builds require an unlocked bootloader.
+- vendor_boot is never repacked, so the first-stage fstab can't be
+  changed by this pipeline -- only checked.
+- The recovery installer can only grow a logical partition if the
+  recovery ships `lptools`; otherwise use the fastboot script.
+- VINTF, linker and SELinux checks are static. A clean matrix means
+  "no known blocker", not "boots". Only `11_diagnostics.sh` on a real
+  device can say more.
+- `mi_product` (annibale-only, unknown role) is excluded; marble has no
+  slot for it. Features that read from it will be missing.
+
+## Bugs found by real runs (all fixed)
+
+Toolchain package names and payload-dumper-go version; `set -e` crash on
+ELFs with no NEEDED; SIGPIPE false negatives in grep checks; passthrough
+silently copying annibale's `init_boot`; relabel running without root;
+APEX/CAPEX libraries counted as missing; VINTF treating optional HALs as
+required and picking an arbitrary matrix; sizing against a guessed limit;
+fstab `ro->rw` writing a literal `\1rw\2` into the vendor mount flags;
+ext4 vendor/odm with no ext4 fstab entry; extraction dropping SELinux
+labels and file capabilities; installer flashing the original vbmeta over
+rebuilt images and `dd`-ing into too-small logical partitions.
