@@ -71,6 +71,7 @@ process_rom_zip() {
         if [ -n "$super_img" ]; then
             log_info "[$label] super.img found: $super_img"
             unsparse_if_needed "$super_img"
+            command -v lpunpack >/dev/null 2>&1 || die "This ROM ships a standalone super.img, which needs lpunpack to unpack -- but lpunpack has no official Ubuntu package and wasn't fetched in 01_toolchain.sh (see the comment there). Build or supply a working 'lpunpack' binary on PATH yourself, then re-run."
             log_info "[$label] Unpacking dynamic partitions with lpunpack"
             lpunpack "$super_img" "$outdir/partitions"
             record_status "${label}_super_unpack" PASS "lpunpack extracted $(find "$outdir/partitions" -name '*.img' | wc -l) images"
