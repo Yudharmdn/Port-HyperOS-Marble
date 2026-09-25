@@ -65,7 +65,7 @@ apply_best_effort_contexts() {
         log_warn "No *_file_contexts found for $part -- skipping context re-application (image will inherit no SELinux labels from this step)"
         return 1
     fi
-    python3 "$SCRIPT_DIR/lib/apply_contexts.py" "$ctxfile" "$tree" "/$part" 2>&1 || true
+    sudo python3 "$SCRIPT_DIR/lib/apply_contexts.py" "$ctxfile" "$tree" "/$part" 2>&1 || true
 }
 
 for entry in "system:$PORT_ROOT/system" "system_ext:$PORT_ROOT/system_ext" "product:$PORT_ROOT/product" \
@@ -109,16 +109,33 @@ for entry in "vendor:$VENDOR_WORK" "odm:$ODM_WORK"; do
     record_status "rebuild_${part}" PASS "$part rebuilt as ${VENDOR_ODM_FS} -> $out"
 done
 
-# ---- 4. passthrough: everything else copied byte-for-byte unmodified ----
+# ---- 4. passthrough: everything else copied byte-for-byte, TARGET ONLY --
+# Never falls back to the source (donor) device's copy here: every name
+# reaching this loop is hardware-specific/shared/unknown (system/
+# system_ext/product/vendor/odm are excluded above and handled by their
+# own rebuild logic). If marble doesn't actually have a given image, the
+# safe, correct behavior is to leave it out and say so loudly --
+# substituting annibale's copy of a hardware-tied blob (modem, tz,
+# keymaster, init_boot, etc.) is exactly the "blindly copy source
+# hardware onto target" this pipeline exists to refuse. (A real run
+# found this fallback silently pulling annibale's init_boot.img into
+# the marble package before this fix.)
+passthrough_missing=0
 while read -r name; do
     case "$name" in system|system_ext|product|vendor|odm) continue ;; esac
     src_img="$TGT_DIR/partitions/${name}.img"
-    [ -f "$src_img" ] || src_img="$SRC_DIR/partitions/${name}.img"
     if [ -f "$src_img" ]; then
         cp "$src_img" "$IMG_DIR/${name}.img"
         log_info "Passthrough (unmodified): $name"
+    else
+        passthrough_missing=$((passthrough_missing + 1))
+        log_warn "$name has no target (marble) image to pass through -- left OUT of the package rather than substituting annibale's copy of a hardware-tied partition"
     fi
 done < "$REPORT_DIR/passthrough_images.txt"
-record_status "passthrough_copy" PASS "hardware-specific images copied through unmodified (boot/vendor_boot/dtbo/firmware/etc.)"
+if [ "$passthrough_missing" -gt 0 ]; then
+    record_status "passthrough_copy" WARN "$passthrough_missing hardware-specific image(s) had no target copy and were left OUT of the package (never substituted from source) -- see log for names"
+else
+    record_status "passthrough_copy" PASS "hardware-specific images copied through unmodified (boot/vendor_boot/dtbo/firmware/etc.)"
+fi
 
 log_info "Image rebuild complete: $IMG_DIR"

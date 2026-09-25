@@ -19,7 +19,7 @@ mkdir -p "$PORT_ROOT"
 : > "$PASSTHROUGH_LIST"
 
 CLASS_TSV="$REPORT_DIR/partition_classification.tsv"
-tail -n +2 "$CLASS_TSV" | while IFS=$'\t' read -r name _avail cls sel _size _fs; do
+tail -n +2 "$CLASS_TSV" | while IFS=$'\t' read -r name _avail _cls sel _size _fs; do
     case "$sel" in
         source)
             src_tree="$WORK_TREE/extract_source/$name"
@@ -43,8 +43,8 @@ tail -n +2 "$CLASS_TSV" | while IFS=$'\t' read -r name _avail cls sel _size _fs;
             echo "$name" >> "$PASSTHROUGH_LIST"
             ;;
     esac
-    case "$cls" in
-        "MISSING-FROM-TARGET") log_warn "$name: MISSING-FROM-TARGET was resolved to a passthrough no-op -- confirm this partition is genuinely optional" ;;
+    case "$sel" in
+        "MISSING-FROM-TARGET") log_warn "$name: MISSING-FROM-TARGET -- 07_rebuild_images.sh will leave this out of the package rather than substitute source's copy; confirm this partition is genuinely optional" ;;
     esac
 done
 

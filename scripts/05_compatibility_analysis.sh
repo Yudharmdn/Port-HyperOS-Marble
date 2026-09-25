@@ -47,9 +47,10 @@ vintf_report="$REPORT_DIR/vintf-report.md"
     echo "# VINTF compatibility (automated first pass)"
     echo
     echo "Scope: extracts <hal name+version+interface+instance> tuples from"
-    echo "the SOURCE framework compatibility matrix and the TARGET vendor/odm"
-    echo "manifests, and flags HALs the matrix requires that no target"
-    echo "manifest declares. Does NOT verify runtime instance behavior."
+    echo "the SOURCE framework compatibility matrix (excluding HALs the"
+    echo "matrix itself marks optional=\"true\") and the TARGET vendor/odm"
+    echo "manifests, and flags required HALs that no target manifest"
+    echo "declares. Does NOT verify runtime instance behavior."
     echo
     echo "| hal | required (source matrix) | present (target manifest) | status |"
     echo "|---|---|---|---|"
@@ -62,7 +63,7 @@ if [ -z "$matrix_file" ] || [ -z "$manifest_files" ]; then
     record_status "vintf_analysis" WARN "matrix or manifest XML not found at expected paths -- manual VINTF review required"
     echo "| (none found) | - | - | NOT TESTED |" >> "$vintf_report"
 else
-    required_hals="$(xmllint --xpath '//hal/name/text()' "$matrix_file" 2>/dev/null | sort -u || true)"
+    required_hals="$(xmllint --xpath '//hal[not(@optional="true")]/name/text()' "$matrix_file" 2>/dev/null | sort -u || true)"
     present_hals=""
     for mf in $manifest_files; do
         present_hals+="$(xmllint --xpath '//hal/name/text()' "$mf" 2>/dev/null || true)"$'\n'
@@ -134,14 +135,55 @@ linker_report="$REPORT_DIR/linker-report.md"
     echo "Scope: for every ELF file under the ported system/system_ext/"
     echo "product tree, lists DT_NEEDED entries and checks whether a"
     echo "library of that SONAME exists anywhere in source+target system/"
-    echo "vendor/odm. This catches missing libraries, NOT symbol-version"
-    echo "mismatches within a present library of the same name."
+    echo "vendor/odm, INCLUDING inside uncompressed Mainline APEX modules"
+    echo "(.apex payloads are unpacked here; .capex COMPRESSED modules are"
+    echo "NOT -- their custom compression isn't implemented, so a library"
+    echo "living only inside a .capex can still show as a false positive"
+    echo "below; the log names how many .capex files were skipped, if any)."
+    echo "This catches missing libraries, NOT symbol-version mismatches"
+    echo "within a present library of the same name."
     echo
     echo "| consumer | missing NEEDED | status |"
     echo "|---|---|---|"
 } > "$linker_report"
 
-lib_inventory="$(find "$EXTRACT_SRC" "$EXTRACT_TGT" \( -iname '*.so' -o -iname '*.so.*' \) -print0 2>/dev/null | xargs -r -0 -n1 basename | sort -u)"
+# APEX-aware inventory. A real run found every one of its "missing"
+# libraries (libicu.so, libstatssocket.so, libstatspull.so,
+# libcom.android.tethering.connectivity_native.so, etc.) to actually be
+# a well-known Mainline APEX module library this check hadn't unpacked
+# -- 100% false positives on that run. An uncompressed .apex is just a
+# zip containing apex_payload.img, itself an ext4 or erofs image --
+# unpacked below with the exact tools already used for the partitions
+# themselves.
+extract_apex_libs() {
+    local root="$1" out="$2"
+    mkdir -p "$out"
+    while IFS= read -r -d '' apex; do
+        local name
+        name="$out/$(basename "$apex" .apex)"
+        mkdir -p "$name/root"
+        if unzip -p "$apex" apex_payload.img > "$name/apex_payload.img" 2>/dev/null && [ -s "$name/apex_payload.img" ]; then
+            local ftype
+            ftype="$(file -b "$name/apex_payload.img" 2>/dev/null)"
+            if grep -qi erofs <<< "$ftype"; then
+                fsck.erofs --extract="$name/root" "$name/apex_payload.img" >/dev/null 2>&1
+            elif grep -qi ext4 <<< "$ftype"; then
+                debugfs -R "rdump / $name/root" "$name/apex_payload.img" >/dev/null 2>&1
+            fi
+        fi
+    done < <(find "$root" -iname '*.apex' -print0 2>/dev/null)
+    local capex_count
+    capex_count="$(find "$root" -iname '*.capex' 2>/dev/null | wc -l)"
+    if [ "$capex_count" -gt 0 ]; then
+        log_warn "linker_analysis: $capex_count compressed .capex module(s) under $root not unpacked (custom compression not implemented) -- a library living only inside one of these can still show as false-positive missing"
+    fi
+    return 0
+}
+APEX_LIBS_DIR="$WORK_TREE/apex_libs_extracted"
+extract_apex_libs "$EXTRACT_SRC" "$APEX_LIBS_DIR/src"
+extract_apex_libs "$EXTRACT_TGT" "$APEX_LIBS_DIR/tgt"
+
+lib_inventory="$(find "$EXTRACT_SRC" "$EXTRACT_TGT" "$APEX_LIBS_DIR" \( -iname '*.so' -o -iname '*.so.*' \) -print0 2>/dev/null | xargs -r -0 -n1 basename | sort -u)"
 missing_total=0
 while IFS= read -r -d '' elf; do
     file -b "$elf" 2>/dev/null | grep -q ELF || continue
