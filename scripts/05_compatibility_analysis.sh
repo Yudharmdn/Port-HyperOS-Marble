@@ -72,7 +72,7 @@ else
     fail_count=0
     while read -r hal; do
         [ -z "$hal" ] && continue
-        if printf '%s\n' "$present_hals" | grep -qx "$hal"; then
+        if grep -qx "$hal" <<< "$present_hals"; then
             echo "| $hal | yes | yes | PASS |" >> "$vintf_report"
         else
             echo "| $hal | yes | **no** | FAIL |" >> "$vintf_report"
@@ -150,7 +150,7 @@ while IFS= read -r -d '' elf; do
     missing=""
     while read -r lib; do
         [ -z "$lib" ] && continue
-        printf '%s\n' "$lib_inventory" | grep -qx "$lib" || missing+="$lib "
+        grep -qx "$lib" <<< "$lib_inventory" || missing+="$lib "
     done <<< "$needed"
     if [ -n "$missing" ]; then
         echo "| ${elf#"$EXTRACT_SRC"/} | $missing | FAIL |" >> "$linker_report"

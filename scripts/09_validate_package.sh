@@ -40,8 +40,8 @@ fi
 boot_provenance="$REPORT_DIR/boot-image-provenance.txt"
 if [ -f "$boot_provenance" ] && [ -f "$IMG_DIR/vbmeta.img" ]; then
     boot_descriptor_present=false
-    if avbtool info_image --image "$IMG_DIR/vbmeta.img" 2>/dev/null \
-        | grep -qiE '^[[:space:]]*Partition Name:[[:space:]]*boot[[:space:]]*$'; then
+    avb_info_output="$(avbtool info_image --image "$IMG_DIR/vbmeta.img" 2>/dev/null || true)"
+    if grep -qiE '^[[:space:]]*Partition Name:[[:space:]]*boot[[:space:]]*$' <<< "$avb_info_output"; then
         boot_descriptor_present=true
     fi
     if [ "$boot_descriptor_present" = "true" ] && [ "${DISABLE_AVB_FOR_TESTING}" = "true" ]; then
