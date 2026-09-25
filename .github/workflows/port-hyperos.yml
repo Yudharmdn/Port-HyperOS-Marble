@@ -16,8 +16,13 @@ name: Port HyperOS ROM (annibale -> marble)
         required: false
         type: boolean
         default: true
+      use_custom_boot_img:
+        description: 'Replace target boot.img with the pre-built Melt-Rebase boot.img (Yudharmdn/boot-melt-rebase) -- invalidates AVB boot descriptor, see avb-report.md'
+        required: false
+        type: boolean
+        default: true
       build_kernel:
-        description: 'Attach the Melt-Rebase kernel as a companion flashable'
+        description: 'Also attach an optional post-boot root-solution zip (KernelSU-Next/Official-KernelSU/ReSukiSU) -- requires KERNEL_ROOT_VARIANT_ASSET_NAME set in port.env; unrelated to the boot image itself'
         required: false
         type: boolean
         default: false
@@ -67,6 +72,7 @@ jobs:
       SOURCE_ROM_URL: ${{ inputs.source_rom_url }}
       TARGET_ROM_URL: ${{ inputs.target_rom_url }}
       ANALYSIS_ONLY: ${{ inputs.analysis_only }}
+      USE_CUSTOM_BOOT_IMG: ${{ inputs.use_custom_boot_img }}
       BUILD_KERNEL: ${{ inputs.build_kernel }}
       RUN_DEVICE_TEST: ${{ inputs.run_device_test }}
       CREATE_RELEASE: ${{ inputs.create_release }}
@@ -163,4 +169,3 @@ jobs:
           files: |
             build/output/*.zip
             build/output/SHA256SUMS
-            
