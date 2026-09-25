@@ -18,7 +18,7 @@ source "$SCRIPT_DIR/../config/port.env"
 classify_partition() {
     case "$1" in
         system|system_ext|product) echo "SOURCE-PORTABLE" ;;
-        vendor|odm|vendor_dlkm|odm_dlkm|vendor_boot|boot|dtbo|dtb|vbmeta|vbmeta_system|vbmeta_vendor) echo "TARGET-HARDWARE-SPECIFIC" ;;
+        vendor|odm|vendor_dlkm|odm_dlkm|vendor_boot|boot|init_boot|dtbo|dtb|vbmeta|vbmeta_system|vbmeta_vendor) echo "TARGET-HARDWARE-SPECIFIC" ;;
         modem|modemst1|modemst2|fsg|bluetooth|dsp|persist|abl|xbl|xbl_config|aop|aop_config|cpucp|devcfg|keymaster|tz|hyp|uefisecapp|qupfw|shrm|imagefv) echo "TARGET-HARDWARE-SPECIFIC" ;;
         super|super_empty|userdata|metadata|misc|frp|cache) echo "SHARED" ;;
         *) echo "UNKNOWN-KEEP-TARGET" ;;

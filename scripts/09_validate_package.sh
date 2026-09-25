@@ -31,6 +31,28 @@ else
     record_status "avb_state" "NOT TESTED" "AVB left as target ROM ships it; report-only inspection in avb-report.md"
 fi
 
+# ---- Cross-check: boot.img replaced (08) vs. vbmeta's original descriptor --
+# A hash/chain descriptor naming "boot" only matches the ORIGINAL boot.img's
+# digest. Swapping boot.img (see boot-image-provenance.txt) without also
+# handling AVB means the packaged vbmeta.img no longer describes what's
+# actually in the package -- a real, checkable incompatibility, not a
+# guess, so it is checked for rather than assumed away either direction.
+boot_provenance="$REPORT_DIR/boot-image-provenance.txt"
+if [ -f "$boot_provenance" ] && [ -f "$IMG_DIR/vbmeta.img" ]; then
+    boot_descriptor_present=false
+    if avbtool info_image --image "$IMG_DIR/vbmeta.img" 2>/dev/null \
+        | grep -qiE '^[[:space:]]*Partition Name:[[:space:]]*boot[[:space:]]*$'; then
+        boot_descriptor_present=true
+    fi
+    if [ "$boot_descriptor_present" = "true" ] && [ "${DISABLE_AVB_FOR_TESTING}" = "true" ]; then
+        record_status "avb_boot_descriptor_mismatch" WARN "vbmeta.img's boot hash descriptor no longer matches the replaced boot.img (see boot-image-provenance.txt) -- mitigated by DISABLE_AVB_FOR_TESTING=true; flash vbmeta-DISABLED-VERIFICATION.img, not the packaged vbmeta.img"
+    elif [ "$boot_descriptor_present" = "true" ]; then
+        record_status "avb_boot_descriptor_mismatch" FAIL "boot.img was replaced (see boot-image-provenance.txt) but vbmeta.img still carries a hash descriptor for the ORIGINAL boot partition. AVB verification will fail on an enforcing bootloader. Set DISABLE_AVB_FOR_TESTING=true, or re-sign vbmeta yourself, before flashing."
+    else
+        record_status "avb_boot_descriptor_mismatch" WARN "boot.img was replaced; avbtool output did not clearly confirm a boot-partition descriptor either way (best-effort text match) -- verify avb-report.md manually before flashing regardless of DISABLE_AVB_FOR_TESTING"
+    fi
+fi
+
 # ---- Compile final matrix -------------------------------------------------
 matrix_md="$REPORT_DIR/build-summary.md"
 {
