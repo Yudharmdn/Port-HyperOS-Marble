@@ -47,14 +47,29 @@ ledger_has_fail() {
 }
 
 # ---- tool detection ---------------------------------------------------
-# Never assume a tool exists. require_tools lists what a stage needs;
-# missing tools are installed via apt where a package is known, else
-# the stage fails loudly instead of silently degrading.
+# Never assume a tool exists -- and never assume a *package name* is
+# right, or that installing it yields a *working* binary, either.
+# simg2img/img2simg and unpack_bootimg are confirmed real, working
+# packages/binaries on Ubuntu 24.04 (noble), checked directly rather
+# than guessed. unpack_bootimg ships from the "mkbootimg" apt package,
+# which ALSO installs an mkbootimg binary -- but that one is verified
+# BROKEN on noble: it crashes on every invocation, even --version,
+# because the package unconditionally imports a "gki" Python module
+# (gki.generate_gki_certificate) it never bundles or declares as a
+# dependency. This pipeline never calls mkbootimg itself, only
+# unpack_bootimg, so that binary being present-but-broken is noted
+# and otherwise ignored rather than silently assumed to work.
+# lpunpack, lpmake, and avbtool have NO official Ubuntu/Debian package
+# at all -- deliberately absent from this map rather than pointed at a
+# guessed name. lpmake is not used anywhere in this pipeline. avbtool
+# is fetched directly as a single, dependency-free file in
+# 01_toolchain.sh (see there). lpunpack is only needed for the rare
+# ROM that ships a standalone super.img (today's payload.bin-based
+# annibale/marble pair does not); 03_extract_detect.sh checks for it
+# lazily, right where it would actually be used.
 declare -A _APT_PKG_FOR=(
     [simg2img]=android-sdk-libsparse-utils [img2simg]=android-sdk-libsparse-utils
-    [lpunpack]=android-sdk-libufdt-utils   [lpmake]=android-sdk-libufdt-utils
-    [mkbootimg]=android-sdk-libufdt-utils  [unpack_bootimg]=android-sdk-libufdt-utils
-    [avbtool]=android-sdk-libufdt-utils
+    [unpack_bootimg]=mkbootimg
     [mkfs.erofs]=erofs-utils [dump.erofs]=erofs-utils [fsck.erofs]=erofs-utils
     [e2fsck]=e2fsprogs [resize2fs]=e2fsprogs [tune2fs]=e2fsprogs [debugfs]=e2fsprogs
     [zstd]=zstd [lz4]=liblz4-tool [jq]=jq [7z]=p7zip-full [xmllint]=libxml2-utils
@@ -62,31 +77,35 @@ declare -A _APT_PKG_FOR=(
 )
 
 ensure_tools() {
-    local missing_pkgs=() missing_bins=()
+    local missing_bins=()
     for bin in "$@"; do
-        if ! command -v "$bin" >/dev/null 2>&1; then
-            missing_bins+=("$bin")
-            local pkg="${_APT_PKG_FOR[$bin]:-}"
-            if [ -n "$pkg" ]; then
-                missing_pkgs+=("$pkg")
-            fi
-        fi
+        command -v "$bin" >/dev/null 2>&1 || missing_bins+=("$bin")
     done
     if [ "${#missing_bins[@]}" -eq 0 ]; then
         return 0
     fi
     log_warn "Missing tools: ${missing_bins[*]}"
-    if [ "${#missing_pkgs[@]}" -gt 0 ]; then
-        log_info "Attempting apt install: ${missing_pkgs[*]}"
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq "${missing_pkgs[@]}" || true
-    fi
+    # Install ONE package at a time. apt-get aborts an entire multi-
+    # package transaction the moment any single named package can't be
+    # resolved -- a wrong or unavailable mapping for tool X must not be
+    # able to take perfectly-installable tool Y down with it (this
+    # exact failure mode blocked xmllint/simg2img/erofs-utils earlier
+    # over one unrelated bad name, despite all three being fine).
+    declare -A seen_pkgs=()
+    for bin in "${missing_bins[@]}"; do
+        local pkg="${_APT_PKG_FOR[$bin]:-}"
+        [ -n "$pkg" ] || continue
+        [ -n "${seen_pkgs[$pkg]:-}" ] && continue
+        seen_pkgs[$pkg]=1
+        log_info "Attempting apt install: $pkg"
+        sudo apt-get install -y -qq "$pkg" || log_warn "apt install failed for '$pkg' -- continuing; other packages are unaffected"
+    done
     local still_missing=()
     for bin in "${missing_bins[@]}"; do
         command -v "$bin" >/dev/null 2>&1 || still_missing+=("$bin")
     done
     if [ "${#still_missing[@]}" -gt 0 ]; then
-        die "Required tools still unavailable after install attempt: ${still_missing[*]}. Not silently continuing -- install them explicitly in the workflow's toolchain step."
+        die "Required tools still unavailable after install attempts: ${still_missing[*]}. Not silently continuing -- these have no working apt mapping in this environment; supply them another way before re-running."
     fi
 }
 
