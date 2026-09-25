@@ -21,9 +21,29 @@ extract_partition() {
     local img="$imgdir/partitions/${part}.img"
     [ -f "$img" ] || { log_warn "extract_partition: $img not found, skipping"; return 1; }
     mkdir -p "$out/$part"
+    # Extract as root, PRESERVING ownership, permissions, SELinux labels
+    # and file capabilities exactly as the device maker built them.
+    # Earlier versions dropped all of these (plain extraction as the
+    # runner user), which is what forced the lossy relabel step and left
+    # fs_config (uid/gid/mode/caps) unreproduced. fsck.erofs here is the
+    # patched v1.9.4 from 01_toolchain.sh (--xattrs, caps kept past chown).
     case "$fs" in
-        erofs) fsck.erofs --extract="$out/$part" "$img" >/dev/null 2>&1 || die "erofs extraction failed for $part" ;;
-        ext4)  debugfs -R "rdump / $out/$part" "$img" >/dev/null 2>&1 || die "ext4 (debugfs rdump) extraction failed for $part" ;;
+        erofs)
+            sudo fsck.erofs --extract="$out/$part" --xattrs --preserve "$img" >/dev/null 2>&1 \
+                || die "erofs extraction failed for $part"
+            ;;
+        ext4)
+            local mnt="$WORK_TREE/.mnt_$part"
+            mkdir -p "$mnt"
+            if sudo mount -o loop,ro "$img" "$mnt" 2>/dev/null; then
+                sudo rsync -aHAX "$mnt/" "$out/$part/" || { sudo umount "$mnt"; die "ext4 copy failed for $part"; }
+                sudo umount "$mnt"
+            else
+                log_warn "loop mount failed for $part -- falling back to debugfs rdump (ownership kept, SELinux labels/capabilities NOT preserved for this partition)"
+                sudo debugfs -R "rdump / $out/$part" "$img" >/dev/null 2>&1 || die "ext4 (debugfs rdump) extraction failed for $part"
+            fi
+            rmdir "$mnt" 2>/dev/null || true
+            ;;
         *) log_warn "extract_partition: unknown fs '$fs' for $part, skipping"; return 1 ;;
     esac
 }
@@ -42,89 +62,139 @@ for p in vendor odm; do
 done
 
 # ---- 1. VINTF -----------------------------------------------------------
+# How libvintf actually decides compatibility (source.android.com, VINTF
+# match rules / FCM lifecycle): it reads the device manifest's
+# target-level and uses the framework compatibility matrix AT THAT
+# LEVEL. Since the Android V-era libvintf change "<matrix><hal> optional
+# attr has default value true" (and the optional tag being unsupported
+# from Android 16), a HAL listed in an Android 17 matrix is NOT required
+# unless explicitly marked optional="false". The previous check counted
+# every listed HAL as required and picked an arbitrary matrix file
+# (find | head -n1) -- which is where the 43 "missing" automotive /
+# broadcastradio / etc. HALs came from. The real gates are:
+#   a) the source framework ships compatibility_matrix.<target-level>.xml
+#      (i.e. it still supports marble's vendor FCM level) -- hard FAIL if not;
+#   b) the kernel version marble runs is allowed by that matrix;
+#   c) every HAL that matrix marks optional="false" is in marble's manifests.
 vintf_report="$REPORT_DIR/vintf-report.md"
+vintf_fail=0
 {
-    echo "# VINTF compatibility (automated first pass)"
+    echo "# VINTF compatibility (framework matrix at marble's FCM level)"
     echo
-    echo "Scope: extracts <hal name+version+interface+instance> tuples from"
-    echo "the SOURCE framework compatibility matrix (excluding HALs the"
-    echo "matrix itself marks optional=\"true\") and the TARGET vendor/odm"
-    echo "manifests, and flags required HALs that no target manifest"
-    echo "declares. Does NOT verify runtime instance behavior."
+    echo "Scope: selects the SOURCE framework compatibility matrix matching the"
+    echo "TARGET device manifest's target-level (as libvintf does), checks that"
+    echo "level is still supported, checks its kernel requirement against"
+    echo "TARGET_KERNEL_VERSION, and requires only HALs explicitly marked"
+    echo "optional=\"false\" (Android 16+: optional defaults to true). Does NOT"
+    echo "run libvintf itself, and does NOT verify runtime HAL behavior."
     echo
-    echo "| hal | required (source matrix) | present (target manifest) | status |"
-    echo "|---|---|---|---|"
 } > "$vintf_report"
 
-matrix_file="$(find "$EXTRACT_SRC/system" -path '*etc/vintf/compatibility_matrix*.xml' 2>/dev/null | head -n1 || true)"
+dev_manifest="$(find "$EXTRACT_TGT/vendor" -path '*etc/vintf/manifest.xml' 2>/dev/null | head -n1 || true)"
+target_level=""
+if [ -n "$dev_manifest" ]; then
+    target_level="$(xmllint --xpath 'string(/manifest/@target-level)' "$dev_manifest" 2>/dev/null || true)"
+fi
 manifest_files="$(find "$EXTRACT_TGT" -path '*etc/vintf/manifest*.xml' 2>/dev/null || true)"
+supported_levels="$(find "$EXTRACT_SRC" -path '*etc/vintf/compatibility_matrix.*.xml' 2>/dev/null \
+    | sed -E 's#.*/compatibility_matrix\.([^/]+)\.xml$#\1#' | grep -v '^device$' | sort -uV | tr '\n' ' ' || true)"
+echo "- target device manifest: \`${dev_manifest#"$EXTRACT_TGT"/}\`, target-level=\`${target_level:-unknown}\`" >> "$vintf_report"
+echo "- FCM levels the source framework supports: \`${supported_levels:-none found}\`" >> "$vintf_report"
 
-if [ -z "$matrix_file" ] || [ -z "$manifest_files" ]; then
-    record_status "vintf_analysis" WARN "matrix or manifest XML not found at expected paths -- manual VINTF review required"
-    echo "| (none found) | - | - | NOT TESTED |" >> "$vintf_report"
+if [ -z "$target_level" ]; then
+    record_status "vintf_analysis" WARN "could not read target-level from marble's vendor manifest -- manual VINTF review required"
 else
-    required_hals="$(xmllint --xpath '//hal[not(@optional="true")]/name/text()' "$matrix_file" 2>/dev/null | sort -u || true)"
-    present_hals=""
-    for mf in $manifest_files; do
-        present_hals+="$(xmllint --xpath '//hal/name/text()' "$mf" 2>/dev/null || true)"$'\n'
-    done
-    present_hals="$(printf '%s' "$present_hals" | sort -u)"
-
-    fail_count=0
-    while read -r hal; do
-        [ -z "$hal" ] && continue
-        if grep -qx "$hal" <<< "$present_hals"; then
-            echo "| $hal | yes | yes | PASS |" >> "$vintf_report"
-        else
-            echo "| $hal | yes | **no** | FAIL |" >> "$vintf_report"
-            fail_count=$((fail_count + 1))
-        fi
-    done <<< "$required_hals"
-
-    if [ "$fail_count" -gt 0 ]; then
-        record_status "vintf_analysis" FAIL "$fail_count required HAL(s) missing from target manifests -- see vintf-report.md"
+    matrix_file="$(find "$EXTRACT_SRC" -path "*etc/vintf/compatibility_matrix.${target_level}.xml" 2>/dev/null | head -n1 || true)"
+    if [ -z "$matrix_file" ]; then
+        vintf_fail=1
+        echo "- **FAIL**: no \`compatibility_matrix.${target_level}.xml\` in the source framework -- it no longer supports marble's vendor FCM level" >> "$vintf_report"
+        record_status "vintf_fcm_level" FAIL "source framework has no compatibility matrix for marble's FCM target-level ${target_level} (supports: ${supported_levels:-none}) -- libvintf will reject this vendor; not fixable by porting scripts"
     else
-        record_status "vintf_analysis" WARN "no missing HAL names detected at the name-level; instance/version-level and AIDL/HIDL interface detail were not exhaustively verified"
+        echo "- matrix used: \`${matrix_file#"$EXTRACT_SRC"/}\`" >> "$vintf_report"
+        record_status "vintf_fcm_level" PASS "source framework still ships compatibility_matrix.${target_level}.xml (marble's FCM target-level)"
+
+        # b) kernel requirement
+        kvers="$(xmllint --xpath '//kernel/@version' "$matrix_file" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -uV || true)"
+        tk="${TARGET_KERNEL_VERSION:-5.10}"
+        if [ -z "$kvers" ]; then
+            echo "- kernel: matrix at this level lists no kernel requirement" >> "$vintf_report"
+            record_status "vintf_kernel" PASS "matrix at level ${target_level} sets no kernel version requirement"
+        elif grep -q "^${tk//./\\.}\." <<< "$kvers"; then
+            echo "- kernel: matrix allows ${tk}.x (listed: $(tr '\n' ' ' <<< "$kvers"))" >> "$vintf_report"
+            record_status "vintf_kernel" PASS "matrix at level ${target_level} allows kernel ${tk}.x"
+        else
+            vintf_fail=1
+            echo "- **FAIL** kernel: matrix does not allow ${tk}.x (listed: $(tr '\n' ' ' <<< "$kvers"))" >> "$vintf_report"
+            record_status "vintf_kernel" FAIL "matrix at level ${target_level} does not list kernel ${tk}.x (allows: $(tr '\n' ' ' <<< "$kvers"))"
+        fi
+
+        # c) explicitly required HALs
+        required_hals="$(xmllint --xpath '//hal[@optional="false"]/name/text()' "$matrix_file" 2>/dev/null | sort -u || true)"
+        present_hals=""
+        for mf in $manifest_files; do
+            present_hals+="$(xmllint --xpath '//hal/name/text()' "$mf" 2>/dev/null || true)"$'\n'
+        done
+        present_hals="$(printf '%s' "$present_hals" | sort -u)"
+        {
+            echo
+            echo "| required HAL (optional=\"false\") | present in marble manifests | status |"
+            echo "|---|---|---|"
+        } >> "$vintf_report"
+        missing_required=0
+        while read -r hal; do
+            [ -z "$hal" ] && continue
+            if grep -qx "$hal" <<< "$present_hals"; then
+                echo "| $hal | yes | PASS |" >> "$vintf_report"
+            else
+                echo "| $hal | **no** | FAIL |" >> "$vintf_report"
+                missing_required=$((missing_required + 1))
+            fi
+        done <<< "$required_hals"
+        [ -n "$required_hals" ] || echo "| (none -- every HAL at this level is optional) | - | PASS |" >> "$vintf_report"
+        if [ "$missing_required" -gt 0 ]; then
+            vintf_fail=1
+            record_status "vintf_required_hals" FAIL "$missing_required HAL(s) marked optional=\"false\" in the level-${target_level} matrix are missing from marble's manifests -- see vintf-report.md"
+        else
+            record_status "vintf_required_hals" PASS "no HAL explicitly required (optional=\"false\") by the level-${target_level} matrix is missing"
+        fi
     fi
 fi
+echo "vintf_fail=$vintf_fail" > "$REPORT_DIR/vintf_result.txt"
 
-# ---- 2. SELinux contexts ------------------------------------------------
+# ---- 2. SELinux: Treble policy compatibility ------------------------------
+# A new platform sepolicy runs against an older vendor policy only through
+# the versioned mapping files the platform ships: system/etc/selinux/
+# mapping/<vendor_ver>.cil (+ <ver>.compat.cil), where <vendor_ver> is in
+# the vendor's plat_sepolicy_vers.txt. If the mapping for marble's vendor
+# version exists, init can compile the split policy and every NEW type in
+# the platform is covered by design -- counting "new types" (the old
+# check's 1762) measures nothing that decides boot. If the mapping is
+# absent, the policy will not compile at boot: that is a hard FAIL.
 selinux_report="$REPORT_DIR/selinux-report.md"
 {
-    echo "# SELinux context compatibility (automated first pass)"
+    echo "# SELinux Treble policy compatibility"
     echo
-    echo "Scope: diffs the SET of context TYPES referenced in source"
-    echo "file_contexts against types known to target policy files. New"
-    echo "types are flagged for MANUAL sepolicy authoring -- this pipeline"
-    echo "never auto-generates allow rules, per policy."
+    echo "Scope: checks that the SOURCE platform policy ships the mapping for"
+    echo "marble's vendor sepolicy version. Runtime denials are NOT predicted"
+    echo "here -- collect avc: denied from a real boot (11_diagnostics.sh)."
     echo
 } > "$selinux_report"
-
-extract_types() { grep -hoE ':[a-zA-Z0-9_]+:s0' "$@" 2>/dev/null | sort -u || true; }
-src_ctx_files="$(find "$EXTRACT_SRC" -iname '*_contexts' -o -iname '*file_contexts*' 2>/dev/null || true)"
-tgt_ctx_files="$(find "$EXTRACT_TGT" -iname '*_contexts' -o -iname '*file_contexts*' 2>/dev/null || true)"
-
-if [ -z "$src_ctx_files" ] || [ -z "$tgt_ctx_files" ]; then
-    record_status "selinux_analysis" WARN "context files not found at expected paths -- manual sepolicy review required"
-    echo "(context files not found; manual review required)" >> "$selinux_report"
+vers_file="$(find "$EXTRACT_TGT/vendor" -path '*etc/selinux/plat_sepolicy_vers.txt' 2>/dev/null | head -n1 || true)"
+vendor_sepol_ver=""
+[ -n "$vers_file" ] && vendor_sepol_ver="$(sudo cat "$vers_file" 2>/dev/null | tr -d '[:space:]' || true)"
+mappings="$(find "$EXTRACT_SRC" -path '*etc/selinux/mapping/*.cil' 2>/dev/null | sed -E 's#.*/##' | sort -u | tr '\n' ' ' || true)"
+{
+    echo "- marble vendor sepolicy version: \`${vendor_sepol_ver:-unknown}\`"
+    echo "- mapping files in source platform: \`${mappings:-none found}\`"
+} >> "$selinux_report"
+if [ -z "$vendor_sepol_ver" ]; then
+    record_status "selinux_mapping" WARN "could not read marble's vendor plat_sepolicy_vers.txt -- manual sepolicy review required"
+elif find "$EXTRACT_SRC" -path "*etc/selinux/mapping/${vendor_sepol_ver}.cil" 2>/dev/null | grep -q .; then
+    echo "- **PASS**: \`mapping/${vendor_sepol_ver}.cil\` present" >> "$selinux_report"
+    record_status "selinux_mapping" PASS "source platform ships mapping/${vendor_sepol_ver}.cil for marble's vendor policy version -- split policy can compile"
 else
-    # shellcheck disable=SC2086
-    src_types="$(extract_types $src_ctx_files)"
-    # shellcheck disable=SC2086
-    tgt_types="$(extract_types $tgt_ctx_files)"
-    new_types="$(comm -23 <(printf '%s\n' "$src_types") <(printf '%s\n' "$tgt_types") | grep -v '^$' || true)"
-    new_count="$(printf '%s\n' "$new_types" | grep -vc '^$' || true)"
-    {
-        echo "New context types referenced by source, absent from target policy:"
-        echo '```'
-        printf '%s\n' "$new_types"
-        echo '```'
-    } >> "$selinux_report"
-    if [ "$new_count" -gt 0 ]; then
-        record_status "selinux_analysis" WARN "$new_count new SELinux type(s) need manual sepolicy authoring -- see selinux-report.md; NOT auto-generated"
-    else
-        record_status "selinux_analysis" PASS "no new context types found beyond target policy"
-    fi
+    echo "- **FAIL**: \`mapping/${vendor_sepol_ver}.cil\` missing" >> "$selinux_report"
+    record_status "selinux_mapping" FAIL "source platform has no mapping/${vendor_sepol_ver}.cil for marble's vendor sepolicy version -- split policy will not compile at boot"
 fi
 
 # ---- 3. Linker / ELF dependency check -----------------------------------
@@ -135,11 +205,8 @@ linker_report="$REPORT_DIR/linker-report.md"
     echo "Scope: for every ELF file under the ported system/system_ext/"
     echo "product tree, lists DT_NEEDED entries and checks whether a"
     echo "library of that SONAME exists anywhere in source+target system/"
-    echo "vendor/odm, INCLUDING inside uncompressed Mainline APEX modules"
-    echo "(.apex payloads are unpacked here; .capex COMPRESSED modules are"
-    echo "NOT -- their custom compression isn't implemented, so a library"
-    echo "living only inside a .capex can still show as a false positive"
-    echo "below; the log names how many .capex files were skipped, if any)."
+    echo "vendor/odm, INCLUDING inside Mainline APEX modules (both .apex"
+    echo "and compressed .capex are unpacked for this inventory)."
     echo "This catches missing libraries, NOT symbol-version mismatches"
     echo "within a present library of the same name."
     echo
@@ -156,27 +223,51 @@ linker_report="$REPORT_DIR/linker-report.md"
 # unpacked below with the exact tools already used for the partitions
 # themselves.
 extract_apex_libs() {
+    # Unpacks every APEX under $1 just far enough to inventory its .so
+    # files. .apex = zip holding apex_payload.img (ext4/erofs). .capex
+    # (compressed APEX) = zip holding the whole original .apex as the
+    # deflated member "original_apex" (AOSP APEX format docs) -- a real
+    # run showed 25 such modules (ART, i18n, statsd, tethering...) are
+    # exactly where every remaining "missing" library lived.
     local root="$1" out="$2"
     mkdir -p "$out"
-    while IFS= read -r -d '' apex; do
-        local name
-        name="$out/$(basename "$apex" .apex)"
-        mkdir -p "$name/root"
-        if unzip -p "$apex" apex_payload.img > "$name/apex_payload.img" 2>/dev/null && [ -s "$name/apex_payload.img" ]; then
-            local ftype
-            ftype="$(file -b "$name/apex_payload.img" 2>/dev/null)"
-            if grep -qi erofs <<< "$ftype"; then
-                fsck.erofs --extract="$name/root" "$name/apex_payload.img" >/dev/null 2>&1
-            elif grep -qi ext4 <<< "$ftype"; then
-                debugfs -R "rdump / $name/root" "$name/apex_payload.img" >/dev/null 2>&1
-            fi
+    local n_apex=0 n_capex=0 n_fail=0
+    unpack_one() {
+        local apexfile="$1" dest="$2"
+        mkdir -p "$dest/root"
+        unzip -p "$apexfile" apex_payload.img > "$dest/apex_payload.img" 2>/dev/null || true
+        [ -s "$dest/apex_payload.img" ] || return 1
+        local ftype
+        ftype="$(file -b "$dest/apex_payload.img" 2>/dev/null)"
+        if grep -qi erofs <<< "$ftype"; then
+            fsck.erofs --extract="$dest/root" "$dest/apex_payload.img" >/dev/null 2>&1 || return 1
+        elif grep -qi ext4 <<< "$ftype"; then
+            debugfs -R "rdump / $dest/root" "$dest/apex_payload.img" >/dev/null 2>&1 || return 1
+        else
+            return 1
         fi
-    done < <(find "$root" -iname '*.apex' -print0 2>/dev/null)
-    local capex_count
-    capex_count="$(find "$root" -iname '*.capex' 2>/dev/null | wc -l)"
-    if [ "$capex_count" -gt 0 ]; then
-        log_warn "linker_analysis: $capex_count compressed .capex module(s) under $root not unpacked (custom compression not implemented) -- a library living only inside one of these can still show as false-positive missing"
-    fi
+        rm -f "$dest/apex_payload.img"
+        # only the library names are needed -- drop everything else
+        find "$dest/root" -type f ! -name '*.so' ! -name '*.so.*' -delete 2>/dev/null || true
+        return 0
+    }
+    while IFS= read -r -d '' apex; do
+        if unpack_one "$apex" "$out/$(basename "$apex")"; then n_apex=$((n_apex + 1)); else n_fail=$((n_fail + 1)); fi
+    done < <(find "$root" -iname '*.apex' -type f -print0 2>/dev/null)
+    while IFS= read -r -d '' capex; do
+        local d
+        d="$out/$(basename "$capex")"
+        mkdir -p "$d"
+        if unzip -p "$capex" original_apex > "$d/original.apex" 2>/dev/null && [ -s "$d/original.apex" ] \
+            && unpack_one "$d/original.apex" "$d"; then
+            n_capex=$((n_capex + 1))
+        else
+            n_fail=$((n_fail + 1))
+        fi
+        rm -f "$d/original.apex"
+    done < <(find "$root" -iname '*.capex' -type f -print0 2>/dev/null)
+    log_info "APEX inventory under $root: $n_apex .apex + $n_capex .capex unpacked, $n_fail failed"
+    [ "$n_fail" -eq 0 ] || log_warn "$n_fail APEX module(s) under $root could not be unpacked -- libraries inside them may show as false-positive missing"
     return 0
 }
 APEX_LIBS_DIR="$WORK_TREE/apex_libs_extracted"

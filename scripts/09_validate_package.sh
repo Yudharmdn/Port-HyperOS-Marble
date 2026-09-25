@@ -7,49 +7,81 @@ source "$SCRIPT_DIR/../config/port.env"
 
 log_section 9 "FINAL VALIDATION MATRIX + PACKAGING"
 
-# ---- AVB inspection (report-only; never silently disabled) --------------
+# ---- AVB ------------------------------------------------------------------
+# Every image this pipeline REBUILDS (system/system_ext/product/vendor/odm)
+# no longer matches the hashtree descriptors in marble's vbmeta /
+# vbmeta_system, and a replaced boot.img no longer matches its hash
+# descriptor. Flashing the original vbmeta over such images = dm-verity
+# corruption / verification failure at boot. So, for a real build:
+#   DISABLE_AVB_FOR_TESTING=true  -> the PACKAGED vbmeta.img and
+#       vbmeta_system.img are freshly authored flags=3 images (verity +
+#       verification disabled; needs an unlocked bootloader). The
+#       originals are kept beside them as *.ORIGINAL.img, never flashed.
+#       (The old design left the original in the package and a side file
+#       "to swap in yourself" -- the installer then flashed the original,
+#       i.e. produced an unbootable result by default.)
+#   DISABLE_AVB_FOR_TESTING=false -> FAIL: re-signing is not implemented.
+# This is an explicit, logged opt-in, never a silent disable.
 avb_report="$REPORT_DIR/avb-report.md"
 { echo "# AVB state"; echo; echo "DISABLE_AVB_FOR_TESTING=${DISABLE_AVB_FOR_TESTING}"; echo; } > "$avb_report"
 for img in "$IMG_DIR"/vbmeta*.img; do
     [ -f "$img" ] || continue
-    { echo "## $(basename "$img")"; echo '```'; avbtool info_image --image "$img" 2>&1 || echo "(not an AVB-signed image or avbtool could not parse it)"; echo '```'; } >> "$avb_report"
+    { echo "## $(basename "$img") (as shipped by $TARGET_DEVICE)"; echo '```'; avbtool info_image --image "$img" 2>&1 || echo "(not parseable by avbtool)"; echo '```'; } >> "$avb_report"
 done
-if [ "${DISABLE_AVB_FOR_TESTING}" = "true" ] && [ -f "$IMG_DIR/vbmeta.img" ]; then
-    # Standard AVB disable is flags=3 (HASHTREE_DISABLED | VERIFICATION_DISABLED)
-    # on a freshly authored vbmeta, not truncating/erasing the original footer.
-    # Written as a clearly separate side file -- the packaged vbmeta.img is
-    # NEVER silently swapped for this; the flasher must consciously use it.
-    if avbtool make_vbmeta_image --flags 3 --padding_size 4096 \
-        --output "$IMG_DIR/vbmeta-DISABLED-VERIFICATION.img" 2>>"$avb_report"; then
-        log_warn "DISABLE_AVB_FOR_TESTING=true: wrote vbmeta-DISABLED-VERIFICATION.img (flags=3) as a SEPARATE file. The packaged vbmeta.img is untouched -- swap it in yourself only if you understand the tradeoff. This omits any chained-partition descriptors the original vbmeta had; verify against avb-report.md before relying on it."
-        record_status "avb_state" WARN "explicit opt-in: vbmeta-DISABLED-VERIFICATION.img produced alongside the normal, still-verified vbmeta.img"
+
+rebuilt_parts=""
+for p in system system_ext product vendor odm; do
+    grep -qP "^rebuild_${p}\tPASS\t" "$STATUS_LEDGER" 2>/dev/null && rebuilt_parts+="$p "
+done
+boot_replaced=false
+[ -f "$REPORT_DIR/boot-image-provenance.txt" ] && boot_replaced=true
+
+if [ "${ANALYSIS_ONLY}" = "true" ]; then
+    record_status "avb_state" "NOT TESTED" "ANALYSIS_ONLY=true -- no images built, AVB not evaluated"
+elif [ -z "$rebuilt_parts" ] && [ "$boot_replaced" = "false" ]; then
+    record_status "avb_state" PASS "no verified image was modified; marble's vbmeta packaged as shipped"
+elif [ "${DISABLE_AVB_FOR_TESTING}" = "true" ]; then
+    avb_ok=true
+    for v in vbmeta vbmeta_system; do
+        [ -f "$IMG_DIR/${v}.img" ] || continue
+        [ -f "$IMG_DIR/${v}.ORIGINAL.img" ] || mv "$IMG_DIR/${v}.img" "$IMG_DIR/${v}.ORIGINAL.img"
+        if ! avbtool make_vbmeta_image --flags 3 --padding_size 4096 --output "$IMG_DIR/${v}.img" 2>>"$avb_report"; then
+            avb_ok=false
+            cp "$IMG_DIR/${v}.ORIGINAL.img" "$IMG_DIR/${v}.img"
+        fi
+    done
+    if [ "$avb_ok" = "true" ]; then
+        { echo "## packaged vbmeta (flags=3, authored by this pipeline)"; echo '```'; avbtool info_image --image "$IMG_DIR/vbmeta.img" 2>&1 || true; echo '```'; } >> "$avb_report"
+        log_warn "AVB verification + dm-verity DISABLED in the packaged vbmeta/vbmeta_system (explicit DISABLE_AVB_FOR_TESTING=true). Requires an UNLOCKED bootloader. Originals kept as *.ORIGINAL.img (not flashed)."
+        record_status "avb_state" WARN "explicit opt-in: packaged vbmeta + vbmeta_system are flags=3 (verity/verification off, unlocked bootloader required) because rebuilt=[${rebuilt_parts}] boot_replaced=${boot_replaced} invalidate the original descriptors"
     else
-        log_warn "avbtool make_vbmeta_image failed -- see avb-report.md; packaged vbmeta.img is untouched either way"
-        record_status "avb_state" WARN "DISABLE_AVB_FOR_TESTING=true requested but avbtool make_vbmeta_image failed; no AVB file was modified"
+        record_status "avb_state" FAIL "DISABLE_AVB_FOR_TESTING=true but avbtool could not author the flags=3 vbmeta -- see avb-report.md; original vbmeta would fail verification over the rebuilt images"
     fi
 else
-    record_status "avb_state" "NOT TESTED" "AVB left as target ROM ships it; report-only inspection in avb-report.md"
+    record_status "avb_state" FAIL "rebuilt=[${rebuilt_parts}] boot_replaced=${boot_replaced}: these no longer match the hashtree/hash descriptors in marble's vbmeta/vbmeta_system -> verification / dm-verity failure at boot. Set DISABLE_AVB_FOR_TESTING=true (unlocked bootloader) -- re-signing is not implemented."
 fi
 
-# ---- Cross-check: boot.img replaced (08) vs. vbmeta's original descriptor --
-# A hash/chain descriptor naming "boot" only matches the ORIGINAL boot.img's
-# digest. Swapping boot.img (see boot-image-provenance.txt) without also
-# handling AVB means the packaged vbmeta.img no longer describes what's
-# actually in the package -- a real, checkable incompatibility, not a
-# guess, so it is checked for rather than assumed away either direction.
-boot_provenance="$REPORT_DIR/boot-image-provenance.txt"
-if [ -f "$boot_provenance" ] && [ -f "$IMG_DIR/vbmeta.img" ]; then
-    boot_descriptor_present=false
-    avb_info_output="$(avbtool info_image --image "$IMG_DIR/vbmeta.img" 2>/dev/null || true)"
-    if grep -qiE '^[[:space:]]*Partition Name:[[:space:]]*boot[[:space:]]*$' <<< "$avb_info_output"; then
-        boot_descriptor_present=true
-    fi
-    if [ "$boot_descriptor_present" = "true" ] && [ "${DISABLE_AVB_FOR_TESTING}" = "true" ]; then
-        record_status "avb_boot_descriptor_mismatch" WARN "vbmeta.img's boot hash descriptor no longer matches the replaced boot.img (see boot-image-provenance.txt) -- mitigated by DISABLE_AVB_FOR_TESTING=true; flash vbmeta-DISABLED-VERIFICATION.img, not the packaged vbmeta.img"
-    elif [ "$boot_descriptor_present" = "true" ]; then
-        record_status "avb_boot_descriptor_mismatch" FAIL "boot.img was replaced (see boot-image-provenance.txt) but vbmeta.img still carries a hash descriptor for the ORIGINAL boot partition. AVB verification will fail on an enforcing bootloader. Set DISABLE_AVB_FOR_TESTING=true, or re-sign vbmeta yourself, before flashing."
+# ---- Dynamic partition group capacity: AUTHORITATIVE check on built images --
+# Real limit = marble's group size from its own OTA payload manifest (04).
+# Sizes = the actual images about to be packaged, not estimates.
+TGT_META="$REPORT_DIR/target_payload_meta.json"
+if [ "${ANALYSIS_ONLY}" != "true" ]; then
+    if [ -f "$TGT_META" ]; then
+        {
+            echo
+            echo "# AUTHORITATIVE check -- actual built images vs marble's real group limit"
+        } >> "$REPORT_DIR/dynamic_partition_sizing.txt"
+        set +e
+        python3 "$SCRIPT_DIR/lib/dynamic_fit.py" built "$TGT_META" "$IMG_DIR" >> "$REPORT_DIR/dynamic_partition_sizing.txt" 2>&1
+        fit_rc=$?
+        set -e
+        case "$fit_rc" in
+            0) record_status "dynamic_partition_sizing" PASS "built images fit marble's real dynamic partition group limit (read from its OTA payload manifest) -- see dynamic_partition_sizing.txt" ;;
+            1) record_status "dynamic_partition_sizing" FAIL "built images EXCEED marble's real dynamic partition group limit -- they cannot all be written to super. Options: VENDOR_ODM_FS=erofs, lower EXT4_MARGIN_PCT, or remove apps from product. See dynamic_partition_sizing.txt" ;;
+            *) record_status "dynamic_partition_sizing" WARN "target payload has no dynamic partition group metadata -- group capacity unverified; check with lpdump on-device" ;;
+        esac
     else
-        record_status "avb_boot_descriptor_mismatch" WARN "boot.img was replaced; avbtool output did not clearly confirm a boot-partition descriptor either way (best-effort text match) -- verify avb-report.md manually before flashing regardless of DISABLE_AVB_FOR_TESTING"
+        record_status "dynamic_partition_sizing" WARN "no target payload manifest -- group capacity unverified; check with lpdump on-device"
     fi
 fi
 
@@ -149,6 +181,23 @@ flash_dynamic() {
     [ -e "\$dev" ] || dev="/dev/block/mapper/\${part}"
     [ -e "\$dev" ] || { ui_print "  !! \$dev tidak ada, dilewati"; return 0; }
     zip_has_entry "\$entry" || return 0
+    # Partisi logis di super punya ukuran SEKARANG milik ROM lama. Image
+    # hasil port bisa lebih besar -- dd ke partisi yang lebih kecil akan
+    # terpotong di tengah. Cek dulu; coba resize via lptools kalau ada.
+    devsize=\$(blockdev --getsize64 "\$dev" 2>/dev/null || echo 0)
+    imgsize=\$(unzip -l "\$ZIP" "\$entry" | awk 'NR==4{print \$1}')
+    if [ "\$devsize" -gt 0 ] && [ "\$imgsize" -gt "\$devsize" ]; then
+        if command -v lptools >/dev/null 2>&1; then
+            ui_print "  \$part terlalu kecil (\${devsize}B < \${imgsize}B), resize via lptools..."
+            lptools resize "\${part}\${SLOT}" "\$imgsize" >/dev/null 2>&1 || lptools resize "\$part" "\$imgsize" >/dev/null 2>&1 || true
+            devsize=\$(blockdev --getsize64 "\$dev" 2>/dev/null || echo 0)
+        fi
+        if [ "\$imgsize" -gt "\$devsize" ]; then
+            ui_print "  !! \$1 (\${imgsize}B) > partisi \$part (\${devsize}B) dan tidak bisa di-resize di recovery ini"
+            ui_print "  !! Pakai flash_fastboot.sh / .bat (fastbootd resize otomatis)"
+            ERRORS=\$((ERRORS + 1)); return 1
+        fi
+    fi
     ui_print "  Flashing \$1 -> \$part (dynamic)"
     unzip -p "\$ZIP" "\$entry" | dd of="\$dev" bs=4M 2>/dev/null || { ui_print "  !! GAGAL flash \$1"; ERRORS=\$((ERRORS + 1)); }
 }
@@ -188,12 +237,48 @@ exit $RC
 BINEOF
 chmod +x "$PKGDIR/META-INF/com/google/android/update-binary"
 
+# ---- fastboot path (fastbootd resizes logical partitions itself) --------
+# Recommended when the ported images are bigger than marble's current
+# logical partitions and the recovery has no lptools. Run from the
+# extracted zip's folder with the phone in bootloader (fastboot) mode.
+{
+    echo '#!/usr/bin/env bash'
+    echo '# Flash port via fastboot. Bootloader must be UNLOCKED. Data is NOT wiped.'
+    echo 'set -e'
+    echo 'cd "$(dirname "$0")/images"'
+    echo 'f() { [ -f "$2" ] && fastboot flash "$1" "$2"; }'
+    for p in $STATIC_PARTS; do echo "f $p $p.img"; done
+    echo 'if [ -d firmware-update ]; then for i in firmware-update/*.img; do n=$(basename "$i" .img); fastboot flash "$n" "$i"; done; fi'
+    echo 'fastboot reboot fastboot'
+    for p in $DYNAMIC_PARTS; do
+        echo "fastboot delete-logical-partition ${p}_a-cow 2>/dev/null || true"
+        echo "fastboot delete-logical-partition ${p}_b-cow 2>/dev/null || true"
+        echo "f $p $p.img"
+    done
+    echo 'fastboot reboot'
+} > "$PKGDIR/flash_fastboot.sh"
+chmod +x "$PKGDIR/flash_fastboot.sh"
+{
+    printf '@echo off\r\n'
+    printf 'rem Flash port via fastboot. Bootloader must be UNLOCKED. Data is NOT wiped.\r\n'
+    printf 'cd /d "%%~dp0images"\r\n'
+    for p in $STATIC_PARTS; do printf 'if exist %s.img fastboot flash %s %s.img\r\n' "$p" "$p" "$p"; done
+    printf 'if exist firmware-update for %%%%i in (firmware-update\\*.img) do fastboot flash %%%%~ni %%%%i\r\n'
+    printf 'fastboot reboot fastboot\r\n'
+    for p in $DYNAMIC_PARTS; do
+        printf 'fastboot delete-logical-partition %s_a-cow\r\n' "$p"
+        printf 'fastboot delete-logical-partition %s_b-cow\r\n' "$p"
+        printf 'if exist %s.img fastboot flash %s %s.img\r\n' "$p" "$p" "$p"
+    done
+    printf 'fastboot reboot\r\npause\r\n'
+} > "$PKGDIR/flash_fastboot.bat"
+
 mkdir -p "$WORKDIR/output"
 ( cd "$PKGDIR" && zip -r -X -q "$WORKDIR/output/${NAME}.zip" . )
 ( cd "$WORKDIR/output" && sha256sum ./*.zip > SHA256SUMS )
 [ -d "$PKG_ROOT" ] && find "$PKG_ROOT" -maxdepth 1 -iname '*Kernel*.zip' -exec cp {} "$WORKDIR/output/" \;
 cp "$REPORT_DIR"/*.md "$WORKDIR/output/" 2>/dev/null || true
 
-record_status "packaging" PASS "recovery-flashable ZIP produced: $WORKDIR/output/${NAME}.zip (custom recovery only -- no fastboot flash.sh path)"
+record_status "packaging" PASS "recovery-flashable ZIP produced: $WORKDIR/output/${NAME}.zip (recovery installer + flash_fastboot.sh/.bat)"
 log_info "Package ready: $WORKDIR/output/"
 log_info "NOTE: does not wipe /data. Clean vs dirty flash is the flasher's choice, per policy (spec section 31)."
