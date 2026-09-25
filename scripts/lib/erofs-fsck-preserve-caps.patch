@@ -1,0 +1,26 @@
+--- a/fsck/main.c
++++ b/fsck/main.c
+@@ -311,6 +311,8 @@
+ 	return 0;
+ }
+ 
++static int erofsfsck_dump_xattrs(struct erofs_inode *inode);
++
+ static void erofsfsck_set_attributes(struct erofs_inode *inode, char *path)
+ {
+ 	int ret;
+@@ -346,6 +348,14 @@
+ 		if (ret < 0)
+ 			erofs_warn("failed to set permissions: %s", path);
+ 	}
++
++	/*
++	 * lchown() above makes the kernel drop security.capability, which
++	 * erofsfsck_dump_xattrs() already wrote -- re-apply xattrs now that
++	 * ownership is final so file capabilities survive extraction.
++	 */
++	if (fsckcfg.check_decomp && fsckcfg.dump_xattrs && fsckcfg.preserve_owner)
++		(void)erofsfsck_dump_xattrs(inode);
+ }
+ 
+ static int erofs_verify_xattr(struct erofs_inode *inode)

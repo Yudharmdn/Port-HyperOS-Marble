@@ -70,10 +70,9 @@ ledger_has_fail() {
 declare -A _APT_PKG_FOR=(
     [simg2img]=android-sdk-libsparse-utils [img2simg]=android-sdk-libsparse-utils
     [unpack_bootimg]=mkbootimg
-    [mkfs.erofs]=erofs-utils [dump.erofs]=erofs-utils [fsck.erofs]=erofs-utils
     [e2fsck]=e2fsprogs [resize2fs]=e2fsprogs [tune2fs]=e2fsprogs [debugfs]=e2fsprogs
     [zstd]=zstd [lz4]=liblz4-tool [jq]=jq [7z]=p7zip-full [xmllint]=libxml2-utils
-    [shellcheck]=shellcheck [rsync]=rsync [file]=file
+    [shellcheck]=shellcheck [rsync]=rsync [file]=file [cpio]=cpio
 )
 
 ensure_tools() {
